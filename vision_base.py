@@ -63,6 +63,7 @@ UART_REPEAT_INTERVAL_MS = 120
 CENTER_JUMP_WINDOW_MS = 250
 CENTER_JUMP_X_LIMIT = 35
 DETECTION_CONFIRM_MS = 200
+DETECTION_CONFIRM_GAP_MS = 300
 
 # HSV thresholds for RGB image converted by cv2.COLOR_RGB2HSV.
 # Adjust S/V lower bounds if the light is weak or the object color is pale.
@@ -103,7 +104,9 @@ fps_smooth = 0.0
 last_center_x = None
 last_center_ms = 0
 confirm_key = None
-confirm_start_ms = 0
+confirm_accum_ms = 0
+confirm_last_seen_ms = 0
+confirm_paused = False
 
 
 def ticks_ms():
@@ -444,27 +447,47 @@ def center_x_is_stable(center):
 
 
 def reset_detection_confirm():
-    global confirm_key, confirm_start_ms
+    global confirm_key, confirm_accum_ms, confirm_last_seen_ms, confirm_paused
 
     confirm_key = None
-    confirm_start_ms = 0
+    confirm_accum_ms = 0
+    confirm_last_seen_ms = 0
+    confirm_paused = False
+
+
+def pause_detection_confirm():
+    global confirm_paused
+
+    if confirm_key is None:
+        return
+    if ticks_ms() - confirm_last_seen_ms > DETECTION_CONFIRM_GAP_MS:
+        reset_detection_confirm()
+        return
+    confirm_paused = True
 
 
 def detection_is_confirmed(shape_name, color_name):
-    global confirm_key, confirm_start_ms
+    global confirm_key, confirm_accum_ms, confirm_last_seen_ms, confirm_paused
 
     if shape_name is None or color_name is None:
-        reset_detection_confirm()
+        pause_detection_confirm()
         return False
 
     now_ms = ticks_ms()
     key = (shape_name, color_name)
-    if key != confirm_key:
+    if (
+        key != confirm_key
+        or confirm_last_seen_ms == 0
+        or now_ms - confirm_last_seen_ms > DETECTION_CONFIRM_GAP_MS
+    ):
         confirm_key = key
-        confirm_start_ms = now_ms
-        return False
+        confirm_accum_ms = 0
+    elif not confirm_paused:
+        confirm_accum_ms += now_ms - confirm_last_seen_ms
 
-    return now_ms - confirm_start_ms >= DETECTION_CONFIRM_MS
+    confirm_last_seen_ms = now_ms
+    confirm_paused = False
+    return confirm_accum_ms >= DETECTION_CONFIRM_MS
 
 
 while not app.need_exit():
@@ -551,7 +574,7 @@ while not app.need_exit():
                 2,
             )
     else:
-        reset_detection_confirm()
+        pause_detection_confirm()
 
     update_uart(detected_shape_name, detected_color_name, uart_send_enabled)
 
