@@ -30,8 +30,8 @@ UART_REPEAT_INTERVAL_MS = 120
 # HSV thresholds for RGB image converted by cv2.COLOR_RGB2HSV.
 # Adjust S/V lower bounds if the light is weak or the object color is pale.
 RED_RANGES = (
-    ((0, 55, 55), (10, 255, 255)),
-    ((170, 55, 55), (179, 255, 255)),
+    ((0, 70, 70), (8, 255, 255)),
+    ((172, 70, 70), (179, 255, 255)),
 )
 GREEN_RANGES = (
     ((32, 40, 40), (95, 255, 255)),
