@@ -63,9 +63,11 @@ UART_REPEAT_INTERVAL_MS = 120
 CENTER_JUMP_WINDOW_MS = 250
 CENTER_JUMP_X_LIMIT = 35
 DETECTION_CONFIRM_MS = 100
-DETECTION_CONFIRM_GAP_MS = 300
-CANDIDATE_CENTER_DIST_LIMIT = 32
-CANDIDATE_AREA_RATIO_LIMIT = 2.4
+DETECTION_CONFIRM_GAP_MS = 450
+CANDIDATE_CENTER_DIST_LIMIT = 45
+CANDIDATE_AREA_RATIO_LIMIT = 3.0
+TRACK_CENTER_DIST_LIMIT = 60
+TRACK_AREA_RATIO_LIMIT = 3.5
 CANDIDATE_SMOOTH_ALPHA = 0.35
 COLOR_FILL_RATIO_MIN = 0.08
 COLOR_DOMINANCE_RATIO_MIN = 1.20
@@ -449,20 +451,31 @@ def update_uart(shape_name=None, color_name=None, send_enabled=True):
     last_send_ms = now_ms
 
 
+def candidate_distance(center):
+    if confirm_center_x is None or confirm_center_y is None:
+        return 0.0
+    return math.hypot(center[0] - confirm_center_x, center[1] - confirm_center_y)
+
+
+def candidate_area_ratio(area):
+    if confirm_area <= 0 or area <= 0:
+        return 1.0
+    return max(area, confirm_area) / min(area, confirm_area)
+
+
 def center_x_is_stable(center):
     global last_center_x, last_center_ms
 
     now_ms = ticks_ms()
     cx = center[0]
-    is_stable = True
 
     if last_center_x is not None and now_ms - last_center_ms <= CENTER_JUMP_WINDOW_MS:
         if abs(cx - last_center_x) > CENTER_JUMP_X_LIMIT:
-            is_stable = False
+            return False
 
     last_center_x = cx
     last_center_ms = now_ms
-    return is_stable
+    return True
 
 
 def reset_detection_confirm():
@@ -502,18 +515,20 @@ def start_detection_confirm(key, center, area, now_ms):
     confirm_area = float(area)
 
 
-def candidate_matches(center, area):
+def candidate_matches(
+    center,
+    area,
+    center_limit=CANDIDATE_CENTER_DIST_LIMIT,
+    area_ratio_limit=CANDIDATE_AREA_RATIO_LIMIT,
+):
     if confirm_center_x is None or confirm_center_y is None:
         return True
 
-    dist = math.hypot(center[0] - confirm_center_x, center[1] - confirm_center_y)
-    if dist > CANDIDATE_CENTER_DIST_LIMIT:
+    if candidate_distance(center) > center_limit:
         return False
 
-    if confirm_area > 0 and area > 0:
-        area_ratio = max(area, confirm_area) / min(area, confirm_area)
-        if area_ratio > CANDIDATE_AREA_RATIO_LIMIT:
-            return False
+    if candidate_area_ratio(area) > area_ratio_limit:
+        return False
 
     return True
 
@@ -527,6 +542,45 @@ def update_candidate_stats(center, area):
     confirm_area = confirm_area * (1.0 - alpha) + area * alpha
 
 
+def target_key(target):
+    return target["shape"], target["color"]
+
+
+def target_track_score(target):
+    distance_score = candidate_distance(target["center"])
+    area_score = abs(math.log(candidate_area_ratio(target["area"]))) * 20.0
+    return distance_score + area_score
+
+
+def target_matches_track(target, require_same_key=True):
+    if confirm_key is None:
+        return False
+    if require_same_key and target_key(target) != confirm_key:
+        return False
+    return candidate_matches(
+        target["center"],
+        target["area"],
+        TRACK_CENTER_DIST_LIMIT,
+        TRACK_AREA_RATIO_LIMIT,
+    )
+
+
+def select_tracking_target(targets):
+    if not targets:
+        return None
+
+    if confirm_key is not None:
+        same_key_targets = [t for t in targets if target_matches_track(t, True)]
+        if same_key_targets:
+            return min(same_key_targets, key=target_track_score)
+
+        same_position_targets = [t for t in targets if target_matches_track(t, False)]
+        if same_position_targets:
+            return min(same_position_targets, key=target_track_score)
+
+    return max(targets, key=lambda item: item["area"])
+
+
 def detection_is_confirmed(shape_name, color_name, center, area):
     global confirm_accum_ms, confirm_last_seen_ms, confirm_paused
 
@@ -536,8 +590,25 @@ def detection_is_confirmed(shape_name, color_name, center, area):
 
     now_ms = ticks_ms()
     key = (shape_name, color_name)
+    key_changed = key != confirm_key
+    candidate_seen_recently = (
+        confirm_key is not None
+        and confirm_last_seen_ms != 0
+        and now_ms - confirm_last_seen_ms <= DETECTION_CONFIRM_GAP_MS
+    )
+    same_physical_target = candidate_matches(
+        center,
+        area,
+        TRACK_CENTER_DIST_LIMIT,
+        TRACK_AREA_RATIO_LIMIT,
+    )
+
+    if key_changed and candidate_seen_recently and same_physical_target:
+        pause_detection_confirm()
+        return False
+
     if (
-        key != confirm_key
+        key_changed
         or confirm_last_seen_ms == 0
         or now_ms - confirm_last_seen_ms > DETECTION_CONFIRM_GAP_MS
         or not candidate_matches(center, area)
@@ -587,7 +658,7 @@ while not app.need_exit():
     uart_send_enabled = True
 
     if targets:
-        best = max(targets, key=lambda item: item["area"])
+        best = select_tracking_target(targets)
         shape_name = best["shape"]
         color_name = best["color"]
         detected_shape_name = shape_name
@@ -596,7 +667,7 @@ while not app.need_exit():
         draw_color = (255, 0, 0) if color_name == "Red" else (0, 255, 0)
         center_stable = center_x_is_stable((cx, cy))
         if not center_stable:
-            reset_detection_confirm()
+            pause_detection_confirm()
             detected_shape_name = None
             detected_color_name = None
             uart_send_enabled = False
