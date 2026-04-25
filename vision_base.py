@@ -62,7 +62,7 @@ UART_BURST_MS = 1800
 UART_REPEAT_INTERVAL_MS = 120
 CENTER_JUMP_WINDOW_MS = 250
 CENTER_JUMP_X_LIMIT = 35
-DETECTION_CONFIRM_MS = 200
+DETECTION_CONFIRM_MS = 100
 DETECTION_CONFIRM_GAP_MS = 300
 
 # HSV thresholds for RGB image converted by cv2.COLOR_RGB2HSV.
@@ -566,7 +566,7 @@ while not app.need_exit():
         elif not uart_send_enabled:
             cv2.putText(
                 img_cv,
-                "WAIT 0.2S",
+                "WAIT 0.1S",
                 (max(0, cx - 55), min(FRAME_H - 8, cy + 24)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
