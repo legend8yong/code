@@ -55,13 +55,13 @@ PERSPECTIVE_DST = np.float32(
 PERSPECTIVE_MATRIX = cv2.getPerspectiveTransform(PERSPECTIVE_SRC, PERSPECTIVE_DST)
 PERSPECTIVE_INV_MATRIX = cv2.getPerspectiveTransform(PERSPECTIVE_DST, PERSPECTIVE_SRC)
 
-MIN_AREA = 120
+MIN_AREA = 70
 MAX_AREA_RATIO = 0.65
 MAX_AREA = DETECT_W * DETECT_H * MAX_AREA_RATIO
 UART_BURST_MS = 1800
 UART_REPEAT_INTERVAL_MS = 120
 CENTER_JUMP_WINDOW_MS = 250
-CENTER_JUMP_X_LIMIT = 35
+CENTER_JUMP_X_LIMIT = 55
 DETECTION_CONFIRM_MS = 100
 DETECTION_CONFIRM_GAP_MS = 450
 CANDIDATE_CENTER_DIST_LIMIT = 45
@@ -69,26 +69,27 @@ CANDIDATE_AREA_RATIO_LIMIT = 3.0
 TRACK_CENTER_DIST_LIMIT = 60
 TRACK_AREA_RATIO_LIMIT = 3.5
 CANDIDATE_SMOOTH_ALPHA = 0.35
-COLOR_FILL_RATIO_MIN = 0.08
-COLOR_DOMINANCE_RATIO_MIN = 1.20
+COLOR_FILL_RATIO_MIN = 0.05
+COLOR_DOMINANCE_RATIO_MIN = 1.08
 
 # HSV thresholds for RGB image converted by cv2.COLOR_RGB2HSV.
 # Adjust S/V lower bounds if the light is weak or the object color is pale.
 RED_RANGES = (
-    ((0, 70, 70), (8, 255, 255)),
-    ((172, 70, 70), (179, 255, 255)),
+    ((0, 55, 45), (10, 255, 255)),
+    ((170, 55, 45), (179, 255, 255)),
 )
 GREEN_RANGES = (
-    ((32, 40, 40), (95, 255, 255)),
+    ((30, 30, 35), (100, 255, 255)),
 )
-REFLECTION_LOW = (0, 0, 180)
-REFLECTION_HIGH = (179, 85, 255)
+REFLECTION_LOW = (0, 0, 155)
+REFLECTION_HIGH = (179, 100, 255)
 
 # Looser thresholds tolerate perspective skew: a square may look like a
 # trapezoid/rhombus when the camera is tilted relative to the target plane.
 SQUARE_SIDE_RATIO_LIMIT = 1.70
 RIGHT_ANGLE_COS_LIMIT = 0.58
 SQUARE_RECT_FILL_MIN = 0.74
+SQUARE_RELAXED_RECT_FILL_MIN = 0.62
 CIRCLE_CIRCULARITY_MIN = 0.66
 CIRCLE_VERTEX_MIN = 6
 CIRCLE_ASPECT_RATIO_LIMIT = 1.55
@@ -96,7 +97,11 @@ CIRCLE_ENCLOSING_FILL_MIN = 0.63
 CIRCLE_ELLIPSE_RATIO_LIMIT = 1.35
 CIRCLE_ELLIPSE_FILL_MIN = 0.70
 CIRCLE_RELAXED_CIRCULARITY_MIN = 0.58
+CIRCLE_RELAXED_ASPECT_RATIO_LIMIT = 1.85
+CIRCLE_RELAXED_ENCLOSING_FILL_MIN = 0.50
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+SMALL_MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+BRIDGE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
 REFLECTION_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
 serial1 = uart.UART(UART_DEVICE, UART_BAUD)
@@ -313,6 +318,39 @@ def classify_shape(contour, area_scale=1.0):
     if strict_circle or fitted_circle:
         return "Circle", circle_approx
 
+    relaxed_approx = cv2.approxPolyDP(shape_contour, 0.050 * perimeter, True)
+    relaxed_points = [tuple(p[0]) for p in relaxed_approx]
+    relaxed_square_score = 0
+    relaxed_circle_score = 0
+
+    if aspect_ratio is not None and aspect_ratio <= CIRCLE_RELAXED_ASPECT_RATIO_LIMIT:
+        relaxed_square_score += 1
+        relaxed_circle_score += 1
+    if rect_fill is not None:
+        if rect_fill >= 0.86:
+            relaxed_square_score += 3
+        elif rect_fill >= SQUARE_RELAXED_RECT_FILL_MIN:
+            relaxed_square_score += 1
+        if rect_fill <= 0.88:
+            relaxed_circle_score += 1
+    if 4 <= len(relaxed_points) <= 6:
+        relaxed_square_score += 2
+    if len(circle_points) >= 5:
+        relaxed_circle_score += 1
+    if circularity >= CIRCLE_RELAXED_CIRCULARITY_MIN:
+        relaxed_circle_score += 2
+    elif circularity >= 0.50:
+        relaxed_circle_score += 1
+    if enclosing_fill >= CIRCLE_RELAXED_ENCLOSING_FILL_MIN:
+        relaxed_circle_score += 1
+    if ellipse_ratio is not None and ellipse_ratio <= CIRCLE_RELAXED_ASPECT_RATIO_LIMIT:
+        relaxed_circle_score += 1
+
+    if relaxed_circle_score > relaxed_square_score and relaxed_circle_score >= 4:
+        return "Circle", circle_approx
+    if relaxed_square_score >= 4:
+        return "Square", relaxed_approx
+
     return None, None
 
 
@@ -330,7 +368,7 @@ def build_range_mask(hsv, ranges):
 
 def build_reflection_mask(hsv, color_mask):
     reflection_mask = cv2.inRange(hsv, REFLECTION_LOW, REFLECTION_HIGH)
-    near_color_mask = cv2.dilate(color_mask, REFLECTION_KERNEL, iterations=1)
+    near_color_mask = cv2.dilate(color_mask, REFLECTION_KERNEL, iterations=2)
     return cv2.bitwise_and(reflection_mask, near_color_mask)
 
 
@@ -338,8 +376,8 @@ def build_target_mask(hsv, red_mask, green_mask):
     mask = cv2.bitwise_or(red_mask, green_mask)
     reflection_mask = build_reflection_mask(hsv, mask)
     mask = cv2.bitwise_or(mask, reflection_mask)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, REFLECTION_KERNEL)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, MORPH_KERNEL)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, BRIDGE_KERNEL)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, SMALL_MORPH_KERNEL)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL)
     return mask
 
@@ -471,6 +509,8 @@ def center_x_is_stable(center):
 
     if last_center_x is not None and now_ms - last_center_ms <= CENTER_JUMP_WINDOW_MS:
         if abs(cx - last_center_x) > CENTER_JUMP_X_LIMIT:
+            last_center_x = cx
+            last_center_ms = now_ms
             return False
 
     last_center_x = cx
