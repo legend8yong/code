@@ -64,6 +64,11 @@ CENTER_JUMP_WINDOW_MS = 250
 CENTER_JUMP_X_LIMIT = 35
 DETECTION_CONFIRM_MS = 100
 DETECTION_CONFIRM_GAP_MS = 300
+CANDIDATE_CENTER_DIST_LIMIT = 32
+CANDIDATE_AREA_RATIO_LIMIT = 2.4
+CANDIDATE_SMOOTH_ALPHA = 0.35
+COLOR_FILL_RATIO_MIN = 0.08
+COLOR_DOMINANCE_RATIO_MIN = 1.20
 
 # HSV thresholds for RGB image converted by cv2.COLOR_RGB2HSV.
 # Adjust S/V lower bounds if the light is weak or the object color is pale.
@@ -107,6 +112,9 @@ confirm_key = None
 confirm_accum_ms = 0
 confirm_last_seen_ms = 0
 confirm_paused = False
+confirm_center_x = None
+confirm_center_y = None
+confirm_area = 0.0
 
 
 def ticks_ms():
@@ -345,11 +353,22 @@ def classify_color(contour, red_mask, green_mask):
 
     red_roi = red_mask[y : y + h, x : x + w]
     green_roi = green_mask[y : y + h, x : x + w]
+    fill_area = cv2.countNonZero(fill_mask)
+    if fill_area <= 0:
+        return None
+
     red_count = cv2.countNonZero(cv2.bitwise_and(red_roi, fill_mask))
     green_count = cv2.countNonZero(cv2.bitwise_and(green_roi, fill_mask))
 
     if red_count <= 0 and green_count <= 0:
         return None
+    best_count = max(red_count, green_count)
+    other_count = min(red_count, green_count)
+    if best_count / float(fill_area) < COLOR_FILL_RATIO_MIN:
+        return None
+    if other_count > 0 and best_count / float(other_count) < COLOR_DOMINANCE_RATIO_MIN:
+        return None
+
     return "Red" if red_count >= green_count else "Green"
 
 
@@ -448,11 +467,15 @@ def center_x_is_stable(center):
 
 def reset_detection_confirm():
     global confirm_key, confirm_accum_ms, confirm_last_seen_ms, confirm_paused
+    global confirm_center_x, confirm_center_y, confirm_area
 
     confirm_key = None
     confirm_accum_ms = 0
     confirm_last_seen_ms = 0
     confirm_paused = False
+    confirm_center_x = None
+    confirm_center_y = None
+    confirm_area = 0.0
 
 
 def pause_detection_confirm():
@@ -466,8 +489,46 @@ def pause_detection_confirm():
     confirm_paused = True
 
 
-def detection_is_confirmed(shape_name, color_name):
+def start_detection_confirm(key, center, area, now_ms):
     global confirm_key, confirm_accum_ms, confirm_last_seen_ms, confirm_paused
+    global confirm_center_x, confirm_center_y, confirm_area
+
+    confirm_key = key
+    confirm_accum_ms = 0
+    confirm_last_seen_ms = now_ms
+    confirm_paused = False
+    confirm_center_x = float(center[0])
+    confirm_center_y = float(center[1])
+    confirm_area = float(area)
+
+
+def candidate_matches(center, area):
+    if confirm_center_x is None or confirm_center_y is None:
+        return True
+
+    dist = math.hypot(center[0] - confirm_center_x, center[1] - confirm_center_y)
+    if dist > CANDIDATE_CENTER_DIST_LIMIT:
+        return False
+
+    if confirm_area > 0 and area > 0:
+        area_ratio = max(area, confirm_area) / min(area, confirm_area)
+        if area_ratio > CANDIDATE_AREA_RATIO_LIMIT:
+            return False
+
+    return True
+
+
+def update_candidate_stats(center, area):
+    global confirm_center_x, confirm_center_y, confirm_area
+
+    alpha = CANDIDATE_SMOOTH_ALPHA
+    confirm_center_x = confirm_center_x * (1.0 - alpha) + center[0] * alpha
+    confirm_center_y = confirm_center_y * (1.0 - alpha) + center[1] * alpha
+    confirm_area = confirm_area * (1.0 - alpha) + area * alpha
+
+
+def detection_is_confirmed(shape_name, color_name, center, area):
+    global confirm_accum_ms, confirm_last_seen_ms, confirm_paused
 
     if shape_name is None or color_name is None:
         pause_detection_confirm()
@@ -479,14 +540,16 @@ def detection_is_confirmed(shape_name, color_name):
         key != confirm_key
         or confirm_last_seen_ms == 0
         or now_ms - confirm_last_seen_ms > DETECTION_CONFIRM_GAP_MS
+        or not candidate_matches(center, area)
     ):
-        confirm_key = key
-        confirm_accum_ms = 0
+        start_detection_confirm(key, center, area, now_ms)
+        return False
     elif not confirm_paused:
         confirm_accum_ms += now_ms - confirm_last_seen_ms
 
     confirm_last_seen_ms = now_ms
     confirm_paused = False
+    update_candidate_stats(center, area)
     return confirm_accum_ms >= DETECTION_CONFIRM_MS
 
 
@@ -537,7 +600,7 @@ while not app.need_exit():
             detected_shape_name = None
             detected_color_name = None
             uart_send_enabled = False
-        elif not detection_is_confirmed(shape_name, color_name):
+        elif not detection_is_confirmed(shape_name, color_name, (cx, cy), best["area"]):
             detected_shape_name = None
             detected_color_name = None
             uart_send_enabled = False
