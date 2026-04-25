@@ -64,13 +64,14 @@ PERSPECTIVE_INV_MATRIX = cv2.getPerspectiveTransform(PERSPECTIVE_DST, PERSPECTIV
 MIN_AREA = 70
 MAX_AREA_RATIO = 0.65
 MAX_AREA = DETECT_W * DETECT_H * MAX_AREA_RATIO
-UART_BURST_MS = 1200
+UART_BURST_MS = 600
 UART_REPEAT_INTERVAL_MS = 120
 UART_SAME_KEY_REARM_MS = 260
 UART_SAME_KEY_REARM_CENTER_SHIFT = 48
 CENTER_JUMP_WINDOW_MS = 250
 CENTER_JUMP_X_LIMIT = 55
 DETECTION_CONFIRM_MS = 100
+FRONT_CONFIRM_MS = 45
 FAST_SWITCH_CONFIRM_MS = 70
 DETECTION_CONFIRM_GAP_MS = 450
 CANDIDATE_CENTER_DIST_LIMIT = 45
@@ -78,6 +79,7 @@ CANDIDATE_AREA_RATIO_LIMIT = 3.0
 TRACK_CENTER_DIST_LIMIT = 60
 TRACK_AREA_RATIO_LIMIT = 3.5
 CANDIDATE_SMOOTH_ALPHA = 0.35
+FRONT_CENTER_X_LIMIT = FRAME_W // 6
 COLOR_FILL_RATIO_MIN = 0.09
 COLOR_STRONG_FILL_RATIO_MIN = 0.16
 COLOR_DOMINANCE_RATIO_MIN = 1.18
@@ -220,6 +222,13 @@ def draw_detection_shape(img_cv, coord_matrix, detect_shape):
     contour = np.rint(trapezoid).astype(np.int32).reshape((-1, 1, 2))
     mapped = transform_contour(contour, coord_matrix)
     cv2.polylines(img_cv, [mapped], True, (90, 90, 90), 1)
+
+
+def draw_front_center_zone(img_cv):
+    x1 = int(round(FRAME_W / 2.0 - FRONT_CENTER_X_LIMIT))
+    x2 = int(round(FRAME_W / 2.0 + FRONT_CENTER_X_LIMIT))
+    cv2.line(img_cv, (x1, DETECT_Y1), (x1, DETECT_Y2), (80, 80, 180), 1)
+    cv2.line(img_cv, (x2, DETECT_Y1), (x2, DETECT_Y2), (80, 80, 180), 1)
 
 
 def point_dist(p1, p2):
@@ -576,11 +585,16 @@ def candidate_area_ratio(area):
     return max(area, confirm_area) / min(area, confirm_area)
 
 
-def center_x_is_stable(center):
+def center_x_is_stable(center, front_target=False):
     global last_center_x, last_center_ms
 
     now_ms = ticks_ms()
     cx = center[0]
+
+    if front_target:
+        last_center_x = cx
+        last_center_ms = now_ms
+        return True
 
     if last_center_x is not None and now_ms - last_center_ms <= CENTER_JUMP_WINDOW_MS:
         if abs(cx - last_center_x) > CENTER_JUMP_X_LIMIT:
@@ -662,6 +676,16 @@ def target_key(target):
     return target["shape"], target["color"]
 
 
+def target_is_front_center(center):
+    return abs(center[0] - FRAME_W / 2.0) <= FRONT_CENTER_X_LIMIT
+
+
+def target_front_score(target):
+    center_error = abs(target["center"][0] - FRAME_W / 2.0)
+    area_bonus = min(target["area"] * 0.03, 35.0)
+    return center_error - area_bonus
+
+
 def target_track_score(target):
     distance_score = candidate_distance(target["center"])
     area_score = abs(math.log(candidate_area_ratio(target["area"]))) * 20.0
@@ -685,35 +709,38 @@ def select_tracking_target(targets):
     if not targets:
         return None
 
+    front_targets = [t for t in targets if target_is_front_center(t["center"])]
+    search_targets = front_targets if front_targets else targets
+
     if uart_active() and uart_key is not None:
-        new_key_targets = [t for t in targets if target_key(t) != uart_key]
+        new_key_targets = [t for t in search_targets if target_key(t) != uart_key]
         if new_key_targets:
-            return max(new_key_targets, key=lambda item: item["area"])
+            return min(new_key_targets, key=target_front_score)
 
         rearm_targets = [
             t
-            for t in targets
+            for t in search_targets
             if target_key(t) == uart_key
             and uart_center is not None
             and math.hypot(t["center"][0] - uart_center[0], t["center"][1] - uart_center[1])
             > UART_SAME_KEY_REARM_CENTER_SHIFT
         ]
         if rearm_targets:
-            return max(rearm_targets, key=lambda item: item["area"])
+            return min(rearm_targets, key=target_front_score)
 
     if confirm_key is not None:
-        same_key_targets = [t for t in targets if target_matches_track(t, True)]
+        same_key_targets = [t for t in search_targets if target_matches_track(t, True)]
         if same_key_targets:
             return min(same_key_targets, key=target_track_score)
 
-        same_position_targets = [t for t in targets if target_matches_track(t, False)]
+        same_position_targets = [t for t in search_targets if target_matches_track(t, False)]
         if same_position_targets:
             return min(same_position_targets, key=target_track_score)
 
-    return max(targets, key=lambda item: item["area"])
+    return min(search_targets, key=target_front_score)
 
 
-def detection_is_confirmed(shape_name, color_name, center, area):
+def detection_is_confirmed(shape_name, color_name, center, area, front_target=False):
     global confirm_accum_ms, confirm_last_seen_ms, confirm_paused
 
     if shape_name is None or color_name is None:
@@ -727,11 +754,13 @@ def detection_is_confirmed(shape_name, color_name, center, area):
         start_detection_confirm(key, center, area, now_ms)
         return False
 
+    center_limit = TRACK_CENTER_DIST_LIMIT if front_target else CANDIDATE_CENTER_DIST_LIMIT
+    area_ratio_limit = TRACK_AREA_RATIO_LIMIT if front_target else CANDIDATE_AREA_RATIO_LIMIT
     if (
         key_changed
         or confirm_last_seen_ms == 0
         or now_ms - confirm_last_seen_ms > DETECTION_CONFIRM_GAP_MS
-        or not candidate_matches(center, area)
+        or not candidate_matches(center, area, center_limit, area_ratio_limit)
     ):
         start_detection_confirm(key, center, area, now_ms)
         return False
@@ -742,7 +771,9 @@ def detection_is_confirmed(shape_name, color_name, center, area):
     confirm_paused = False
     update_candidate_stats(center, area)
     required_confirm_ms = DETECTION_CONFIRM_MS
-    if uart_active() and (key != uart_key or confirm_generation != uart_event_id):
+    if front_target:
+        required_confirm_ms = FRONT_CONFIRM_MS
+    elif uart_active() and (key != uart_key or confirm_generation != uart_event_id):
         required_confirm_ms = FAST_SWITCH_CONFIRM_MS
     return confirm_accum_ms >= required_confirm_ms
 
@@ -776,6 +807,7 @@ while not app.need_exit():
     )
 
     draw_detection_shape(img_cv, coord_matrix, target_mask.shape)
+    draw_front_center_zone(img_cv)
 
     detected_shape_name = None
     detected_color_name = None
@@ -791,17 +823,32 @@ while not app.need_exit():
         detected_color_name = color_name
         cx, cy = best["center"]
         draw_color = (255, 0, 0) if color_name == "Red" else (0, 255, 0)
-        center_stable = center_x_is_stable((cx, cy))
-        if not center_stable:
+        front_target = target_is_front_center((cx, cy))
+        center_stable = True
+        if not front_target:
             pause_detection_confirm()
             detected_shape_name = None
             detected_color_name = None
             uart_send_enabled = False
-        elif not detection_is_confirmed(shape_name, color_name, (cx, cy), best["area"]):
+        else:
+            center_stable = center_x_is_stable((cx, cy), front_target)
+
+        if front_target and not center_stable:
+            pause_detection_confirm()
             detected_shape_name = None
             detected_color_name = None
             uart_send_enabled = False
-        else:
+        elif front_target and not detection_is_confirmed(
+            shape_name,
+            color_name,
+            (cx, cy),
+            best["area"],
+            front_target,
+        ):
+            detected_shape_name = None
+            detected_color_name = None
+            uart_send_enabled = False
+        elif front_target:
             detected_event_id = confirm_generation
             detected_center = (cx, cy)
 
@@ -816,7 +863,17 @@ while not app.need_exit():
             draw_color,
             2,
         )
-        if not center_stable:
+        if not front_target:
+            cv2.putText(
+                img_cv,
+                "NOT FRONT",
+                (max(0, cx - 55), min(FRAME_H - 8, cy + 24)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 0),
+                2,
+            )
+        elif not center_stable:
             cv2.putText(
                 img_cv,
                 "CENTER JUMP",
@@ -829,7 +886,7 @@ while not app.need_exit():
         elif not uart_send_enabled:
             cv2.putText(
                 img_cv,
-                "WAIT 0.1S",
+                "WAIT FRONT",
                 (max(0, cx - 55), min(FRAME_H - 8, cy + 24)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
