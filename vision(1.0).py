@@ -5,11 +5,11 @@ import numpy as np
 import time
 
 
-# MaixCAM2 UART2: B0(TX), B1(RX), device /dev/ttyS2.
-# If your board exposes UART2 on different pins, only change these mappings.
-pinmap.set_pin_function("B0", "UART2_TX")
-pinmap.set_pin_function("B1", "UART2_RX")
-UART_DEVICE = "/dev/ttyS2"
+# UART1: A19(TX), A18(RX), device /dev/ttyS1.
+# If your board exposes UART1 on different pins, only change these mappings.
+pinmap.set_pin_function("A18", "UART1_RX")
+pinmap.set_pin_function("A19", "UART1_TX")
+UART_DEVICE = "/dev/ttyS1"
 UART_BAUD = 115200
 
 FRAME_W = 320
@@ -38,7 +38,7 @@ CIRCLE_CIRCULARITY_MIN = 0.72
 CIRCLE_VERTEX_MIN = 6
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-serial2 = uart.UART(UART_DEVICE, UART_BAUD)
+serial1 = uart.UART(UART_DEVICE, UART_BAUD)
 cam = camera.Camera(FRAME_W, FRAME_H)
 disp = display.Display()
 
@@ -187,7 +187,7 @@ def send_result(shape_name, color_name):
     if msg == last_msg and now_ms - last_send_ms < SEND_INTERVAL_MS:
         return
 
-    serial2.write_str(msg + "\n")
+    serial1.write_str(msg + "\n")
     last_msg = msg
     last_send_ms = now_ms
 
