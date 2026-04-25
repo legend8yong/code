@@ -66,9 +66,12 @@ MAX_AREA_RATIO = 0.65
 MAX_AREA = DETECT_W * DETECT_H * MAX_AREA_RATIO
 UART_BURST_MS = 1200
 UART_REPEAT_INTERVAL_MS = 120
+UART_SAME_KEY_REARM_MS = 260
+UART_SAME_KEY_REARM_CENTER_SHIFT = 48
 CENTER_JUMP_WINDOW_MS = 250
 CENTER_JUMP_X_LIMIT = 55
 DETECTION_CONFIRM_MS = 100
+FAST_SWITCH_CONFIRM_MS = 70
 DETECTION_CONFIRM_GAP_MS = 450
 CANDIDATE_CENTER_DIST_LIMIT = 45
 CANDIDATE_AREA_RATIO_LIMIT = 3.0
@@ -121,13 +124,18 @@ cam = camera.Camera(FRAME_W, FRAME_H)
 disp = display.Display()
 
 uart_msg = None
+uart_key = None
+uart_event_id = None
+uart_center = None
 uart_burst_end_ms = 0
+uart_event_start_ms = 0
 last_send_ms = 0
 last_frame_ts = time.time()
 fps_smooth = 0.0
 last_center_x = None
 last_center_ms = 0
 confirm_key = None
+confirm_generation = 0
 confirm_accum_ms = 0
 confirm_last_seen_ms = 0
 confirm_paused = False
@@ -492,28 +500,68 @@ def find_targets(
     return targets
 
 
-def update_uart(shape_name=None, color_name=None, send_enabled=True):
-    global uart_msg, uart_burst_end_ms, last_send_ms
+def update_uart(shape_name=None, color_name=None, send_enabled=True, event_id=None, center=None):
+    global uart_msg, uart_key, uart_event_id, uart_center, uart_burst_end_ms
+    global uart_event_start_ms, last_send_ms
 
     now_ms = ticks_ms()
     if uart_msg is not None and now_ms >= uart_burst_end_ms:
         uart_msg = None
+        uart_key = None
+        uart_event_id = None
+        uart_center = None
 
-    if not send_enabled:
-        return
+    new_key = None
+    new_msg = None
+    if shape_name is not None and color_name is not None:
+        new_key = (shape_name, color_name)
+        new_msg = "S:{},C:{}".format(shape_name, color_name)
+
+    if send_enabled and new_msg is not None:
+        new_event = event_id is not None and event_id != uart_event_id
+        if uart_msg is None or new_msg != uart_msg or new_event:
+            uart_msg = new_msg
+            uart_key = new_key
+            uart_event_id = event_id
+            uart_center = center
+            uart_event_start_ms = now_ms
+            uart_burst_end_ms = now_ms + UART_BURST_MS
+            last_send_ms = now_ms - UART_REPEAT_INTERVAL_MS
 
     if uart_msg is None:
-        if shape_name is None or color_name is None:
-            return
-        uart_msg = "S:{},C:{}".format(shape_name, color_name)
-        uart_burst_end_ms = now_ms + UART_BURST_MS
-        last_send_ms = now_ms - UART_REPEAT_INTERVAL_MS
+        return
+
+    if now_ms >= uart_burst_end_ms:
+        uart_msg = None
+        uart_key = None
+        uart_event_id = None
+        uart_center = None
+        return
 
     if now_ms - last_send_ms < UART_REPEAT_INTERVAL_MS:
         return
 
     serial1.write_str(uart_msg + "\n")
     last_send_ms = now_ms
+
+
+def uart_active():
+    return uart_msg is not None and ticks_ms() < uart_burst_end_ms
+
+
+def same_uart_event_should_rearm(key, center):
+    if (
+        not uart_active()
+        or uart_key != key
+        or uart_event_id != confirm_generation
+        or uart_center is None
+    ):
+        return False
+
+    if ticks_ms() - uart_event_start_ms < UART_SAME_KEY_REARM_MS:
+        return False
+
+    return math.hypot(center[0] - uart_center[0], center[1] - uart_center[1]) > UART_SAME_KEY_REARM_CENTER_SHIFT
 
 
 def candidate_distance(center):
@@ -570,10 +618,11 @@ def pause_detection_confirm():
 
 
 def start_detection_confirm(key, center, area, now_ms):
-    global confirm_key, confirm_accum_ms, confirm_last_seen_ms, confirm_paused
+    global confirm_key, confirm_generation, confirm_accum_ms, confirm_last_seen_ms, confirm_paused
     global confirm_center_x, confirm_center_y, confirm_area
 
     confirm_key = key
+    confirm_generation += 1
     confirm_accum_ms = 0
     confirm_last_seen_ms = now_ms
     confirm_paused = False
@@ -636,6 +685,22 @@ def select_tracking_target(targets):
     if not targets:
         return None
 
+    if uart_active() and uart_key is not None:
+        new_key_targets = [t for t in targets if target_key(t) != uart_key]
+        if new_key_targets:
+            return max(new_key_targets, key=lambda item: item["area"])
+
+        rearm_targets = [
+            t
+            for t in targets
+            if target_key(t) == uart_key
+            and uart_center is not None
+            and math.hypot(t["center"][0] - uart_center[0], t["center"][1] - uart_center[1])
+            > UART_SAME_KEY_REARM_CENTER_SHIFT
+        ]
+        if rearm_targets:
+            return max(rearm_targets, key=lambda item: item["area"])
+
     if confirm_key is not None:
         same_key_targets = [t for t in targets if target_matches_track(t, True)]
         if same_key_targets:
@@ -658,20 +723,8 @@ def detection_is_confirmed(shape_name, color_name, center, area):
     now_ms = ticks_ms()
     key = (shape_name, color_name)
     key_changed = key != confirm_key
-    candidate_seen_recently = (
-        confirm_key is not None
-        and confirm_last_seen_ms != 0
-        and now_ms - confirm_last_seen_ms <= DETECTION_CONFIRM_GAP_MS
-    )
-    same_physical_target = candidate_matches(
-        center,
-        area,
-        TRACK_CENTER_DIST_LIMIT,
-        TRACK_AREA_RATIO_LIMIT,
-    )
-
-    if key_changed and candidate_seen_recently and same_physical_target:
-        pause_detection_confirm()
+    if not key_changed and same_uart_event_should_rearm(key, center):
+        start_detection_confirm(key, center, area, now_ms)
         return False
 
     if (
@@ -688,7 +741,10 @@ def detection_is_confirmed(shape_name, color_name, center, area):
     confirm_last_seen_ms = now_ms
     confirm_paused = False
     update_candidate_stats(center, area)
-    return confirm_accum_ms >= DETECTION_CONFIRM_MS
+    required_confirm_ms = DETECTION_CONFIRM_MS
+    if uart_active() and (key != uart_key or confirm_generation != uart_event_id):
+        required_confirm_ms = FAST_SWITCH_CONFIRM_MS
+    return confirm_accum_ms >= required_confirm_ms
 
 
 while not app.need_exit():
@@ -723,6 +779,8 @@ while not app.need_exit():
 
     detected_shape_name = None
     detected_color_name = None
+    detected_event_id = None
+    detected_center = None
     uart_send_enabled = True
 
     if targets:
@@ -743,6 +801,9 @@ while not app.need_exit():
             detected_shape_name = None
             detected_color_name = None
             uart_send_enabled = False
+        else:
+            detected_event_id = confirm_generation
+            detected_center = (cx, cy)
 
         cv2.drawContours(img_cv, [best["approx"]], -1, draw_color, 2)
         cv2.drawMarker(img_cv, (cx, cy), draw_color, cv2.MARKER_CROSS, 18, 2)
@@ -778,7 +839,13 @@ while not app.need_exit():
     else:
         pause_detection_confirm()
 
-    update_uart(detected_shape_name, detected_color_name, uart_send_enabled)
+    update_uart(
+        detected_shape_name,
+        detected_color_name,
+        uart_send_enabled,
+        detected_event_id,
+        detected_center,
+    )
 
     cv2.putText(
         img_cv,
