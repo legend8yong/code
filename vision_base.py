@@ -21,11 +21,16 @@ DETECT_Y1 = 0
 DETECT_Y2 = FRAME_H * 2 // 3
 DETECT_H = DETECT_Y2 - DETECT_Y1
 DETECT_SCALE = 1.0
-DETECT_TRIANGLE = np.float32(
+DETECT_TRAPEZOID_BOTTOM_RATIO = 0.45
+DETECT_TRAPEZOID_BOTTOM_W = DETECT_W * DETECT_TRAPEZOID_BOTTOM_RATIO
+DETECT_TRAPEZOID_BOTTOM_X1 = (DETECT_W - DETECT_TRAPEZOID_BOTTOM_W) / 2.0
+DETECT_TRAPEZOID_BOTTOM_X2 = DETECT_TRAPEZOID_BOTTOM_X1 + DETECT_TRAPEZOID_BOTTOM_W - 1
+DETECT_TRAPEZOID = np.float32(
     (
         (0, 0),
         (DETECT_W - 1, 0),
-        ((DETECT_W - 1) / 2.0, DETECT_H - 1),
+        (DETECT_TRAPEZOID_BOTTOM_X2, DETECT_H - 1),
+        (DETECT_TRAPEZOID_BOTTOM_X1, DETECT_H - 1),
     )
 )
 PERSPECTIVE_ENABLE = False
@@ -55,6 +60,8 @@ MAX_AREA_RATIO = 0.65
 MAX_AREA = DETECT_W * DETECT_H * MAX_AREA_RATIO
 UART_BURST_MS = 1800
 UART_REPEAT_INTERVAL_MS = 120
+CENTER_JUMP_WINDOW_MS = 250
+CENTER_JUMP_X_LIMIT = 35
 
 # HSV thresholds for RGB image converted by cv2.COLOR_RGB2HSV.
 # Adjust S/V lower bounds if the light is weak or the object color is pale.
@@ -92,6 +99,8 @@ uart_burst_end_ms = 0
 last_send_ms = 0
 last_frame_ts = time.time()
 fps_smooth = 0.0
+last_center_x = None
+last_center_ms = 0
 
 
 def ticks_ms():
@@ -147,27 +156,27 @@ def transform_point(point, matrix):
     return int(round(mapped[0])), int(round(mapped[1]))
 
 
-def build_triangle_mask(shape):
+def build_detection_shape_mask(shape):
     h, w = shape[:2]
     scale_x = w / float(DETECT_W)
     scale_y = h / float(DETECT_H)
-    triangle = DETECT_TRIANGLE.copy()
-    triangle[:, 0] *= scale_x
-    triangle[:, 1] *= scale_y
+    trapezoid = DETECT_TRAPEZOID.copy()
+    trapezoid[:, 0] *= scale_x
+    trapezoid[:, 1] *= scale_y
 
     mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillConvexPoly(mask, np.rint(triangle).astype(np.int32), 255)
-    return mask, triangle
+    cv2.fillConvexPoly(mask, np.rint(trapezoid).astype(np.int32), 255)
+    return mask, trapezoid
 
 
 def apply_detection_shape_mask(mask):
-    triangle_mask, _ = build_triangle_mask(mask.shape)
-    return cv2.bitwise_and(mask, triangle_mask)
+    shape_mask, _ = build_detection_shape_mask(mask.shape)
+    return cv2.bitwise_and(mask, shape_mask)
 
 
 def draw_detection_shape(img_cv, coord_matrix, detect_shape):
-    _, triangle = build_triangle_mask(detect_shape)
-    contour = np.rint(triangle).astype(np.int32).reshape((-1, 1, 2))
+    _, trapezoid = build_detection_shape_mask(detect_shape)
+    contour = np.rint(trapezoid).astype(np.int32).reshape((-1, 1, 2))
     mapped = transform_contour(contour, coord_matrix)
     cv2.polylines(img_cv, [mapped], True, (90, 90, 90), 1)
 
@@ -391,12 +400,15 @@ def find_targets(
     return targets
 
 
-def update_uart(shape_name=None, color_name=None):
+def update_uart(shape_name=None, color_name=None, send_enabled=True):
     global uart_msg, uart_burst_end_ms, last_send_ms
 
     now_ms = ticks_ms()
     if uart_msg is not None and now_ms >= uart_burst_end_ms:
         uart_msg = None
+
+    if not send_enabled:
+        return
 
     if uart_msg is None:
         if shape_name is None or color_name is None:
@@ -410,6 +422,22 @@ def update_uart(shape_name=None, color_name=None):
 
     serial1.write_str(uart_msg + "\n")
     last_send_ms = now_ms
+
+
+def center_x_is_stable(center):
+    global last_center_x, last_center_ms
+
+    now_ms = ticks_ms()
+    cx = center[0]
+    is_stable = True
+
+    if last_center_x is not None and now_ms - last_center_ms <= CENTER_JUMP_WINDOW_MS:
+        if abs(cx - last_center_x) > CENTER_JUMP_X_LIMIT:
+            is_stable = False
+
+    last_center_x = cx
+    last_center_ms = now_ms
+    return is_stable
 
 
 while not app.need_exit():
@@ -443,6 +471,7 @@ while not app.need_exit():
 
     detected_shape_name = None
     detected_color_name = None
+    uart_send_enabled = True
 
     if targets:
         best = max(targets, key=lambda item: item["area"])
@@ -452,6 +481,11 @@ while not app.need_exit():
         detected_color_name = color_name
         cx, cy = best["center"]
         draw_color = (255, 0, 0) if color_name == "Red" else (0, 255, 0)
+        center_stable = center_x_is_stable((cx, cy))
+        if not center_stable:
+            detected_shape_name = None
+            detected_color_name = None
+            uart_send_enabled = False
 
         cv2.drawContours(img_cv, [best["approx"]], -1, draw_color, 2)
         cv2.drawMarker(img_cv, (cx, cy), draw_color, cv2.MARKER_CROSS, 18, 2)
@@ -464,8 +498,18 @@ while not app.need_exit():
             draw_color,
             2,
         )
+        if not center_stable:
+            cv2.putText(
+                img_cv,
+                "CENTER JUMP",
+                (max(0, cx - 65), min(FRAME_H - 8, cy + 24)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 0),
+                2,
+            )
 
-    update_uart(detected_shape_name, detected_color_name)
+    update_uart(detected_shape_name, detected_color_name, uart_send_enabled)
 
     cv2.putText(
         img_cv,
