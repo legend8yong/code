@@ -66,8 +66,8 @@ MAX_AREA_RATIO = 0.65
 MAX_AREA = DETECT_W * DETECT_H * MAX_AREA_RATIO
 UART_BURST_MS = 600
 UART_REPEAT_INTERVAL_MS = 120
-UART_SAME_KEY_REARM_MS = 260
-UART_SAME_KEY_REARM_CENTER_SHIFT = 48
+UART_SAME_KEY_REARM_MS = 160
+UART_SAME_KEY_REARM_CENTER_SHIFT = 30
 CENTER_JUMP_WINDOW_MS = 250
 CENTER_JUMP_X_LIMIT = 55
 DETECTION_CONFIRM_MS = 100
@@ -682,8 +682,7 @@ def target_is_front_center(center):
 
 def target_front_score(target):
     center_error = abs(target["center"][0] - FRAME_W / 2.0)
-    area_bonus = min(target["area"] * 0.03, 35.0)
-    return center_error - area_bonus
+    return center_error, -target["area"]
 
 
 def target_track_score(target):
@@ -710,7 +709,10 @@ def select_tracking_target(targets):
         return None
 
     front_targets = [t for t in targets if target_is_front_center(t["center"])]
-    search_targets = front_targets if front_targets else targets
+    if front_targets:
+        return min(front_targets, key=target_front_score)
+
+    search_targets = targets
 
     if uart_active() and uart_key is not None:
         new_key_targets = [t for t in search_targets if target_key(t) != uart_key]
