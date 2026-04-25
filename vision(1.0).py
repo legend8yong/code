@@ -24,7 +24,8 @@ DETECT_H = DETECT_Y2 - DETECT_Y1
 MIN_AREA = 350
 MAX_AREA_RATIO = 0.65
 MAX_AREA = DETECT_W * DETECT_H * MAX_AREA_RATIO
-UART_COOLDOWN_MS = 3000
+UART_BURST_MS = 3000
+UART_REPEAT_INTERVAL_MS = 120
 
 # HSV thresholds for RGB image converted by cv2.COLOR_RGB2HSV.
 # Adjust S/V lower bounds if the light is weak or the object color is pale.
@@ -51,6 +52,8 @@ serial1 = uart.UART(UART_DEVICE, UART_BAUD)
 cam = camera.Camera(FRAME_W, FRAME_H)
 disp = display.Display()
 
+uart_msg = None
+uart_burst_end_ms = 0
 last_send_ms = 0
 last_frame_ts = time.time()
 fps_smooth = 0.0
@@ -202,15 +205,24 @@ def find_targets(mask, red_mask, green_mask, x_offset=0, y_offset=0):
     return targets
 
 
-def send_result(shape_name, color_name):
-    global last_send_ms
+def update_uart(shape_name=None, color_name=None):
+    global uart_msg, uart_burst_end_ms, last_send_ms
 
     now_ms = ticks_ms()
-    if now_ms - last_send_ms < UART_COOLDOWN_MS:
+    if uart_msg is not None and now_ms >= uart_burst_end_ms:
+        uart_msg = None
+
+    if uart_msg is None:
+        if shape_name is None or color_name is None:
+            return
+        uart_msg = "S:{},C:{}".format(shape_name, color_name)
+        uart_burst_end_ms = now_ms + UART_BURST_MS
+        last_send_ms = now_ms - UART_REPEAT_INTERVAL_MS
+
+    if now_ms - last_send_ms < UART_REPEAT_INTERVAL_MS:
         return
 
-    msg = "S:{},C:{}".format(shape_name, color_name)
-    serial1.write_str(msg + "\n")
+    serial1.write_str(uart_msg + "\n")
     last_send_ms = now_ms
 
 
@@ -241,14 +253,17 @@ while not app.need_exit():
         1,
     )
 
+    detected_shape_name = None
+    detected_color_name = None
+
     if targets:
         best = max(targets, key=lambda item: item["area"])
         shape_name = best["shape"]
         color_name = best["color"]
+        detected_shape_name = shape_name
+        detected_color_name = color_name
         cx, cy = best["center"]
         draw_color = (255, 0, 0) if color_name == "Red" else (0, 255, 0)
-
-        send_result(shape_name, color_name)
 
         cv2.drawContours(img_cv, [best["approx"]], -1, draw_color, 2)
         cv2.drawMarker(img_cv, (cx, cy), draw_color, cv2.MARKER_CROSS, 18, 2)
@@ -261,6 +276,8 @@ while not app.need_exit():
             draw_color,
             2,
         )
+
+    update_uart(detected_shape_name, detected_color_name)
 
     cv2.putText(
         img_cv,
