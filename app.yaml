@@ -1,0 +1,8 @@
+id: v_123
+name: vision
+version: 1.0.0
+author: yzh
+icon: ''
+desc: fk ds
+files:
+  - vision(1.0).py

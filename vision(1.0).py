@@ -30,8 +30,10 @@ GREEN_RANGES = (
     ((35, 60, 45), (90, 255, 255)),
 )
 
-SQUARE_SIDE_RATIO_LIMIT = 1.25
-RIGHT_ANGLE_COS_LIMIT = 0.35
+# Looser thresholds tolerate perspective skew: a square may look like a
+# trapezoid/rhombus when the camera is tilted relative to the target plane.
+SQUARE_SIDE_RATIO_LIMIT = 1.80
+RIGHT_ANGLE_COS_LIMIT = 0.65
 CIRCLE_CIRCULARITY_MIN = 0.72
 CIRCLE_VERTEX_MIN = 6
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
