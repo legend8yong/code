@@ -17,10 +17,13 @@ FRAME_H = 240
 DETECT_X1 = FRAME_W // 4
 DETECT_X2 = FRAME_W * 3 // 4
 DETECT_W = DETECT_X2 - DETECT_X1
+DETECT_Y1 = 0
+DETECT_Y2 = FRAME_H * 2 // 3
+DETECT_H = DETECT_Y2 - DETECT_Y1
 
 MIN_AREA = 350
 MAX_AREA_RATIO = 0.65
-MAX_AREA = DETECT_W * FRAME_H * MAX_AREA_RATIO
+MAX_AREA = DETECT_W * DETECT_H * MAX_AREA_RATIO
 SEND_INTERVAL_MS = 120
 
 # HSV thresholds for RGB image converted by cv2.COLOR_RGB2HSV.
@@ -146,7 +149,7 @@ def classify_color(contour, red_mask, green_mask):
     return "Red" if red_count >= green_count else "Green"
 
 
-def find_targets(mask, red_mask, green_mask, x_offset=0):
+def find_targets(mask, red_mask, green_mask, x_offset=0, y_offset=0):
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     targets = []
 
@@ -169,9 +172,10 @@ def find_targets(mask, red_mask, green_mask, x_offset=0):
 
         cx = int(m["m10"] / m["m00"])
         cy = int(m["m01"] / m["m00"])
-        if x_offset:
-            approx = approx + (x_offset, 0)
+        if x_offset or y_offset:
+            approx = approx + (x_offset, y_offset)
             cx += x_offset
+            cy += y_offset
 
         targets.append(
             {
@@ -209,19 +213,19 @@ while not app.need_exit():
 
     img = cam.read()
     img_cv = image.image2cv(img, ensure_bgr=False, copy=False)
-    detect_roi = img_cv[:, DETECT_X1:DETECT_X2]
+    detect_roi = img_cv[DETECT_Y1:DETECT_Y2, DETECT_X1:DETECT_X2]
     hsv = cv2.cvtColor(detect_roi, cv2.COLOR_RGB2HSV)
 
     red_mask = build_range_mask(hsv, RED_RANGES)
     green_mask = build_range_mask(hsv, GREEN_RANGES)
     target_mask = build_target_mask(red_mask, green_mask)
 
-    targets = find_targets(target_mask, red_mask, green_mask, DETECT_X1)
+    targets = find_targets(target_mask, red_mask, green_mask, DETECT_X1, DETECT_Y1)
 
     cv2.rectangle(
         img_cv,
-        (DETECT_X1, 0),
-        (DETECT_X2 - 1, FRAME_H - 1),
+        (DETECT_X1, DETECT_Y1),
+        (DETECT_X2 - 1, DETECT_Y2 - 1),
         (90, 90, 90),
         1,
     )
