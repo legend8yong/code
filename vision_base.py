@@ -58,7 +58,7 @@ PERSPECTIVE_INV_MATRIX = cv2.getPerspectiveTransform(PERSPECTIVE_DST, PERSPECTIV
 MIN_AREA = 70
 MAX_AREA_RATIO = 0.65
 MAX_AREA = DETECT_W * DETECT_H * MAX_AREA_RATIO
-UART_BURST_MS = 1800
+UART_BURST_MS = 1200
 UART_REPEAT_INTERVAL_MS = 120
 CENTER_JUMP_WINDOW_MS = 250
 CENTER_JUMP_X_LIMIT = 55
@@ -69,20 +69,26 @@ CANDIDATE_AREA_RATIO_LIMIT = 3.0
 TRACK_CENTER_DIST_LIMIT = 60
 TRACK_AREA_RATIO_LIMIT = 3.5
 CANDIDATE_SMOOTH_ALPHA = 0.35
-COLOR_FILL_RATIO_MIN = 0.05
-COLOR_DOMINANCE_RATIO_MIN = 1.08
+COLOR_FILL_RATIO_MIN = 0.09
+COLOR_STRONG_FILL_RATIO_MIN = 0.16
+COLOR_DOMINANCE_RATIO_MIN = 1.18
+COLOR_MEAN_S_MIN = 38
+NEUTRAL_S_MAX = 35
+WHITE_V_MIN = 145
+DARK_V_MAX = 60
+NEUTRAL_DARK_RATIO_MAX = 0.68
 
 # HSV thresholds for RGB image converted by cv2.COLOR_RGB2HSV.
 # Adjust S/V lower bounds if the light is weak or the object color is pale.
 RED_RANGES = (
-    ((0, 55, 45), (10, 255, 255)),
-    ((170, 55, 45), (179, 255, 255)),
+    ((0, 65, 50), (9, 255, 255)),
+    ((171, 65, 50), (179, 255, 255)),
 )
 GREEN_RANGES = (
-    ((30, 30, 35), (100, 255, 255)),
+    ((35, 45, 45), (92, 255, 255)),
 )
-REFLECTION_LOW = (0, 0, 155)
-REFLECTION_HIGH = (179, 100, 255)
+REFLECTION_LOW = (0, 0, 190)
+REFLECTION_HIGH = (179, 70, 255)
 
 # Looser thresholds tolerate perspective skew: a square may look like a
 # trapezoid/rhombus when the camera is tilted relative to the target plane.
@@ -101,7 +107,7 @@ CIRCLE_RELAXED_ASPECT_RATIO_LIMIT = 1.85
 CIRCLE_RELAXED_ENCLOSING_FILL_MIN = 0.50
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 SMALL_MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-BRIDGE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+BRIDGE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 REFLECTION_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
 serial1 = uart.UART(UART_DEVICE, UART_BAUD)
@@ -368,7 +374,7 @@ def build_range_mask(hsv, ranges):
 
 def build_reflection_mask(hsv, color_mask):
     reflection_mask = cv2.inRange(hsv, REFLECTION_LOW, REFLECTION_HIGH)
-    near_color_mask = cv2.dilate(color_mask, REFLECTION_KERNEL, iterations=2)
+    near_color_mask = cv2.dilate(color_mask, REFLECTION_KERNEL, iterations=1)
     return cv2.bitwise_and(reflection_mask, near_color_mask)
 
 
@@ -382,7 +388,7 @@ def build_target_mask(hsv, red_mask, green_mask):
     return mask
 
 
-def classify_color(contour, red_mask, green_mask):
+def classify_color(contour, red_mask, green_mask, hsv):
     x, y, w, h = cv2.boundingRect(contour)
     if w <= 0 or h <= 0:
         return None
@@ -393,6 +399,7 @@ def classify_color(contour, red_mask, green_mask):
 
     red_roi = red_mask[y : y + h, x : x + w]
     green_roi = green_mask[y : y + h, x : x + w]
+    hsv_roi = hsv[y : y + h, x : x + w]
     fill_area = cv2.countNonZero(fill_mask)
     if fill_area <= 0:
         return None
@@ -404,9 +411,22 @@ def classify_color(contour, red_mask, green_mask):
         return None
     best_count = max(red_count, green_count)
     other_count = min(red_count, green_count)
-    if best_count / float(fill_area) < COLOR_FILL_RATIO_MIN:
+    color_fill_ratio = best_count / float(fill_area)
+    if color_fill_ratio < COLOR_FILL_RATIO_MIN:
         return None
     if other_count > 0 and best_count / float(other_count) < COLOR_DOMINANCE_RATIO_MIN:
+        return None
+
+    mean_s = cv2.mean(hsv_roi[:, :, 1], mask=fill_mask)[0]
+    white_like = cv2.inRange(hsv_roi, (0, 0, WHITE_V_MIN), (179, NEUTRAL_S_MAX, 255))
+    dark_like = cv2.inRange(hsv_roi, (0, 0, 0), (179, 255, DARK_V_MAX))
+    neutral_dark = cv2.bitwise_or(white_like, dark_like)
+    neutral_dark_count = cv2.countNonZero(cv2.bitwise_and(neutral_dark, fill_mask))
+    neutral_dark_ratio = neutral_dark_count / float(fill_area)
+    if (
+        color_fill_ratio < COLOR_STRONG_FILL_RATIO_MIN
+        and (mean_s < COLOR_MEAN_S_MIN or neutral_dark_ratio > NEUTRAL_DARK_RATIO_MAX)
+    ):
         return None
 
     return "Red" if red_count >= green_count else "Green"
@@ -416,6 +436,7 @@ def find_targets(
     mask,
     red_mask,
     green_mask,
+    hsv,
     x_offset=0,
     y_offset=0,
     coord_matrix=None,
@@ -434,7 +455,7 @@ def find_targets(
         if shape_name is None:
             continue
 
-        color_name = classify_color(contour, red_mask, green_mask)
+        color_name = classify_color(contour, red_mask, green_mask, hsv)
         if color_name is None:
             continue
 
@@ -687,6 +708,7 @@ while not app.need_exit():
         target_mask,
         red_mask,
         green_mask,
+        hsv,
         coord_matrix=coord_matrix,
         area_scale=area_scale,
     )
