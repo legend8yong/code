@@ -62,6 +62,7 @@ UART_BURST_MS = 1800
 UART_REPEAT_INTERVAL_MS = 120
 CENTER_JUMP_WINDOW_MS = 250
 CENTER_JUMP_X_LIMIT = 35
+DETECTION_CONFIRM_MS = 500
 
 # HSV thresholds for RGB image converted by cv2.COLOR_RGB2HSV.
 # Adjust S/V lower bounds if the light is weak or the object color is pale.
@@ -101,6 +102,8 @@ last_frame_ts = time.time()
 fps_smooth = 0.0
 last_center_x = None
 last_center_ms = 0
+confirm_key = None
+confirm_start_ms = 0
 
 
 def ticks_ms():
@@ -440,6 +443,30 @@ def center_x_is_stable(center):
     return is_stable
 
 
+def reset_detection_confirm():
+    global confirm_key, confirm_start_ms
+
+    confirm_key = None
+    confirm_start_ms = 0
+
+
+def detection_is_confirmed(shape_name, color_name):
+    global confirm_key, confirm_start_ms
+
+    if shape_name is None or color_name is None:
+        reset_detection_confirm()
+        return False
+
+    now_ms = ticks_ms()
+    key = (shape_name, color_name)
+    if key != confirm_key:
+        confirm_key = key
+        confirm_start_ms = now_ms
+        return False
+
+    return now_ms - confirm_start_ms >= DETECTION_CONFIRM_MS
+
+
 while not app.need_exit():
     now = time.time()
     dt = now - last_frame_ts
@@ -483,6 +510,11 @@ while not app.need_exit():
         draw_color = (255, 0, 0) if color_name == "Red" else (0, 255, 0)
         center_stable = center_x_is_stable((cx, cy))
         if not center_stable:
+            reset_detection_confirm()
+            detected_shape_name = None
+            detected_color_name = None
+            uart_send_enabled = False
+        elif not detection_is_confirmed(shape_name, color_name):
             detected_shape_name = None
             detected_color_name = None
             uart_send_enabled = False
@@ -508,6 +540,18 @@ while not app.need_exit():
                 (255, 255, 0),
                 2,
             )
+        elif not uart_send_enabled:
+            cv2.putText(
+                img_cv,
+                "WAIT 0.5S",
+                (max(0, cx - 55), min(FRAME_H - 8, cy + 24)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 0),
+                2,
+            )
+    else:
+        reset_detection_confirm()
 
     update_uart(detected_shape_name, detected_color_name, uart_send_enabled)
 
