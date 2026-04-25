@@ -24,31 +24,33 @@ DETECT_H = DETECT_Y2 - DETECT_Y1
 MIN_AREA = 350
 MAX_AREA_RATIO = 0.65
 MAX_AREA = DETECT_W * DETECT_H * MAX_AREA_RATIO
-SEND_INTERVAL_MS = 120
+UART_COOLDOWN_MS = 3000
 
 # HSV thresholds for RGB image converted by cv2.COLOR_RGB2HSV.
 # Adjust S/V lower bounds if the light is weak or the object color is pale.
 RED_RANGES = (
-    ((0, 70, 50), (10, 255, 255)),
-    ((170, 70, 50), (179, 255, 255)),
+    ((0, 45, 45), (12, 255, 255)),
+    ((168, 45, 45), (179, 255, 255)),
 )
 GREEN_RANGES = (
-    ((35, 60, 45), (90, 255, 255)),
+    ((32, 40, 40), (95, 255, 255)),
 )
+REFLECTION_LOW = (0, 0, 180)
+REFLECTION_HIGH = (179, 85, 255)
 
 # Looser thresholds tolerate perspective skew: a square may look like a
 # trapezoid/rhombus when the camera is tilted relative to the target plane.
 SQUARE_SIDE_RATIO_LIMIT = 1.80
 RIGHT_ANGLE_COS_LIMIT = 0.65
-CIRCLE_CIRCULARITY_MIN = 0.72
+CIRCLE_CIRCULARITY_MIN = 0.65
 CIRCLE_VERTEX_MIN = 6
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+REFLECTION_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
 
 serial1 = uart.UART(UART_DEVICE, UART_BAUD)
 cam = camera.Camera(FRAME_W, FRAME_H)
 disp = display.Display()
 
-last_msg = ""
 last_send_ms = 0
 last_frame_ts = time.time()
 fps_smooth = 0.0
@@ -90,15 +92,16 @@ def is_square(points):
 
 
 def classify_shape(contour):
-    area = cv2.contourArea(contour)
+    shape_contour = cv2.convexHull(contour)
+    area = cv2.contourArea(shape_contour)
     if area < MIN_AREA:
         return None, None
 
-    perimeter = cv2.arcLength(contour, True)
+    perimeter = cv2.arcLength(shape_contour, True)
     if perimeter <= 0:
         return None, None
 
-    approx = cv2.approxPolyDP(contour, 0.035 * perimeter, True)
+    approx = cv2.approxPolyDP(shape_contour, 0.035 * perimeter, True)
     points = [tuple(p[0]) for p in approx]
 
     if cv2.isContourConvex(approx) and is_square(points):
@@ -123,8 +126,17 @@ def build_range_mask(hsv, ranges):
     return mask
 
 
-def build_target_mask(red_mask, green_mask):
+def build_reflection_mask(hsv, color_mask):
+    reflection_mask = cv2.inRange(hsv, REFLECTION_LOW, REFLECTION_HIGH)
+    near_color_mask = cv2.dilate(color_mask, REFLECTION_KERNEL, iterations=1)
+    return cv2.bitwise_and(reflection_mask, near_color_mask)
+
+
+def build_target_mask(hsv, red_mask, green_mask):
     mask = cv2.bitwise_or(red_mask, green_mask)
+    reflection_mask = build_reflection_mask(hsv, mask)
+    mask = cv2.bitwise_or(mask, reflection_mask)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, REFLECTION_KERNEL)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, MORPH_KERNEL)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, MORPH_KERNEL)
     return mask
@@ -191,15 +203,14 @@ def find_targets(mask, red_mask, green_mask, x_offset=0, y_offset=0):
 
 
 def send_result(shape_name, color_name):
-    global last_msg, last_send_ms
+    global last_send_ms
 
     now_ms = ticks_ms()
-    msg = "S:{},C:{}".format(shape_name, color_name)
-    if msg == last_msg and now_ms - last_send_ms < SEND_INTERVAL_MS:
+    if now_ms - last_send_ms < UART_COOLDOWN_MS:
         return
 
+    msg = "S:{},C:{}".format(shape_name, color_name)
     serial1.write_str(msg + "\n")
-    last_msg = msg
     last_send_ms = now_ms
 
 
@@ -218,7 +229,7 @@ while not app.need_exit():
 
     red_mask = build_range_mask(hsv, RED_RANGES)
     green_mask = build_range_mask(hsv, GREEN_RANGES)
-    target_mask = build_target_mask(red_mask, green_mask)
+    target_mask = build_target_mask(hsv, red_mask, green_mask)
 
     targets = find_targets(target_mask, red_mask, green_mask, DETECT_X1, DETECT_Y1)
 
